@@ -102,18 +102,51 @@ function nowSec() {
   return Math.floor(Date.now() / 1000);
 }
 
+/**
+ * 纯 JS 的 base64 / base64url 解码。
+ * ⚠️ 不能依赖 atob 或 Buffer：Egern 的脚本引擎（QuickJS）里两者都可能不存在。
+ */
+var B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function b64ToUtf8(input) {
+  var str = String(input || "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  var bytes = [];
+  var buffer = 0;
+  var bits = 0;
+  for (var i = 0; i < str.length; i++) {
+    var v = B64_CHARS.indexOf(str.charAt(i));
+    if (v < 0) continue;
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+  var out = "";
+  for (var j = 0; j < bytes.length; ) {
+    var b = bytes[j++];
+    if (b < 0x80) out += String.fromCharCode(b);
+    else if (b >= 0xc0 && b < 0xe0 && j < bytes.length)
+      out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[j++] & 0x3f));
+    else if (b >= 0xe0 && b < 0xf0 && j + 1 < bytes.length)
+      out += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[j++] & 0x3f) << 6) | (bytes[j++] & 0x3f));
+    else if (b >= 0xf0 && j + 2 < bytes.length) {
+      var cp = ((b & 0x07) << 18) | ((bytes[j++] & 0x3f) << 12) | ((bytes[j++] & 0x3f) << 6) | (bytes[j++] & 0x3f);
+      cp -= 0x10000;
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    }
+  }
+  return out;
+}
+
 /** 解出 access_token(JWT) 里的邮箱，用于校验令牌归属。 */
 function emailFromToken(token) {
   try {
     var parts = String(token || "").split(".");
     if (parts.length < 2) return "";
-    var seg = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    while (seg.length % 4) seg += "=";
-    var raw =
-      typeof atob === "function"
-        ? atob(seg)
-        : Buffer.from(seg, "base64").toString("utf8");
-    return String((JSON.parse(raw) || {}).email || "").toLowerCase().trim();
+    var payload = JSON.parse(b64ToUtf8(parts[1])) || {};
+    return String(payload.email || "").toLowerCase().trim();
   } catch (e) {
     return "";
   }

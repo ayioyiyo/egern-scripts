@@ -60,20 +60,84 @@ function unwrap(payload) {
   return payload;
 }
 
+/**
+ * 纯 JS 的 base64 / base64url 解码。
+ * ⚠️ 不能依赖 atob 或 Buffer：Egern 的脚本引擎（QuickJS）里两者都可能不存在，
+ * 之前 v10 第一版就因为这里抛异常被 catch 吞掉，导致邮箱永远解不出、
+ * 抓取脚本以为「无法确定账号」而放弃接管 —— 表现就是「抓不到 token」。
+ */
+var B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function b64ToUtf8(input) {
+  var str = String(input || "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  var bytes = [];
+  var buffer = 0;
+  var bits = 0;
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charAt(i);
+    var v = B64_CHARS.indexOf(c);
+    if (v < 0) continue; // 跳过非法字符
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+  // UTF-8 解码
+  var out = "";
+  for (var j = 0; j < bytes.length; ) {
+    var b = bytes[j++];
+    if (b < 0x80) {
+      out += String.fromCharCode(b);
+    } else if (b >= 0xc0 && b < 0xe0 && j < bytes.length) {
+      out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[j++] & 0x3f));
+    } else if (b >= 0xe0 && b < 0xf0 && j + 1 < bytes.length) {
+      out += String.fromCharCode(
+        ((b & 0x0f) << 12) | ((bytes[j++] & 0x3f) << 6) | (bytes[j++] & 0x3f)
+      );
+    } else if (b >= 0xf0 && j + 2 < bytes.length) {
+      var cp =
+        ((b & 0x07) << 18) |
+        ((bytes[j++] & 0x3f) << 12) |
+        ((bytes[j++] & 0x3f) << 6) |
+        (bytes[j++] & 0x3f);
+      cp -= 0x10000;
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    }
+  }
+  return out;
+}
+
 function emailFromToken(token) {
   try {
     var parts = String(token || "").split(".");
     if (parts.length < 2) return "";
-    var seg = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    while (seg.length % 4) seg += "=";
-    var raw =
-      typeof atob === "function"
-        ? atob(seg)
-        : Buffer.from(seg, "base64").toString("utf8");
-    return String((JSON.parse(raw) || {}).email || "").toLowerCase();
+    var payload = JSON.parse(b64ToUtf8(parts[1])) || {};
+    return String(payload.email || "").toLowerCase().trim();
   } catch (e) {
+    console.log("星驰抓取[" + VERSION + "]：令牌解码失败 " + (e && e.message));
     return "";
   }
+}
+
+/** 安全读取请求头（Headers 对象 / 普通对象 / 大小写不定 都能读）。 */
+function readHeader(headers, name) {
+  if (!headers) return "";
+  try {
+    if (typeof headers.get === "function") {
+      var hv = headers.get(name);
+      if (hv) return String(hv);
+    }
+  } catch (e) {}
+  var lower = String(name).toLowerCase();
+  for (var k in headers) {
+    if (String(k).toLowerCase() === lower) {
+      var val = headers[k];
+      return val === null || val === undefined ? "" : String(val);
+    }
+  }
+  return "";
 }
 
 function bearer(headers) {
@@ -286,6 +350,10 @@ async function harvest(ctx, url, headers, respBody) {
   return pass; // 响应原样回传，绝不改包
 }
 
+// 接管请求用的标记头：入口看到它就立刻放行，
+// 避免「脚本自己发起的 refresh」又被自己的响应钩子捕获（递归）。
+var SELF_HEADER = "X-Xingchi-Takeover";
+
 /** 用浏览器的 RT 自己刷新一次，拿到属于签到方的独立 RT。 */
 async function takeOver(ctx, url, rt) {
   var origin = "https://api.xingchiapi.com";
@@ -299,6 +367,7 @@ async function takeOver(ctx, url, rt) {
         "Content-Type": "application/json",
         Accept: "application/json",
         "User-Agent": UA,
+        "X-Xingchi-Takeover": "1",
       },
       body: JSON.stringify({ refresh_token: rt }),
       timeout: 20000,
@@ -323,6 +392,13 @@ export default async function (ctx) {
 
   var url = (ctx && ctx.request && ctx.request.url) || "";
   var headers = (ctx && ctx.request && ctx.request.headers) || {};
+
+  // 自己发起的接管请求：直接放行（防递归）
+  if (readHeader(headers, "x-xingchi-takeover")) {
+    console.log("星驰抓取[" + VERSION + "]：自身接管请求，放行");
+    return;
+  }
+
   var respBody = "";
   try {
     respBody = await ctx.response.text();

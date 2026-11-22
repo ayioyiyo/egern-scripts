@@ -56,17 +56,42 @@ function storage(ctx) {
   return null;
 }
 
+var B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/** 纯 JS base64 解码（Egern 的 QuickJS 里没有 atob/Buffer）。 */
+function b64ToUtf8(input) {
+  const str = String(input || "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  const bytes = [];
+  let buffer = 0, bits = 0;
+  for (let i = 0; i < str.length; i++) {
+    const v = B64_CHARS.indexOf(str.charAt(i));
+    if (v < 0) continue;
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) { bits -= 8; bytes.push((buffer >> bits) & 0xff); }
+  }
+  let out = "";
+  for (let j = 0; j < bytes.length; ) {
+    const b = bytes[j++];
+    if (b < 0x80) out += String.fromCharCode(b);
+    else if (b >= 0xc0 && b < 0xe0 && j < bytes.length)
+      out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[j++] & 0x3f));
+    else if (b >= 0xe0 && b < 0xf0 && j + 1 < bytes.length)
+      out += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[j++] & 0x3f) << 6) | (bytes[j++] & 0x3f));
+    else if (b >= 0xf0 && j + 2 < bytes.length) {
+      let cp = ((b & 0x07) << 18) | ((bytes[j++] & 0x3f) << 12) | ((bytes[j++] & 0x3f) << 6) | (bytes[j++] & 0x3f);
+      cp -= 0x10000;
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    }
+  }
+  return out;
+}
+
 function emailFromToken(token) {
   try {
     const parts = String(token || "").split(".");
     if (parts.length < 2) return "";
-    let seg = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    while (seg.length % 4) seg += "=";
-    const raw =
-      typeof atob === "function"
-        ? atob(seg)
-        : Buffer.from(seg, "base64").toString("utf8");
-    return String((JSON.parse(raw) || {}).email || "").toLowerCase().trim();
+    return String((JSON.parse(b64ToUtf8(parts[1])) || {}).email || "").toLowerCase().trim();
   } catch (e) {
     return "";
   }
