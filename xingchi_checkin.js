@@ -33,12 +33,13 @@
  *   XINGCHI_ACCOUNTS: '[{"name":"主号","email":"a@x.com","password":"p","refresh_token":"rt_x"}]'
  */
 
-const VERSION = "v9";
+const VERSION = "v10";
 const DEFAULT_BASE = "https://api.xingchiapi.com";
 const STORE_PREFIX = "xingchi_auth:";
 const CAPTURED_KEY = "xingchi_auth:captured";
 const CAPTURE_ENABLE_KEY = "xingchi_capture_enabled";
 const REGISTRY_KEY = "xingchi_accounts"; // xingchi_capture.js 落库的固定键
+const DONE_PREFIX = "xingchi_capture_done:"; // 每个账号独立的"已接管"标记
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 " +
   "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
@@ -101,6 +102,39 @@ function nowSec() {
   return Math.floor(Date.now() / 1000);
 }
 
+/** 解出 access_token(JWT) 里的邮箱，用于校验令牌归属。 */
+function emailFromToken(token) {
+  try {
+    var parts = String(token || "").split(".");
+    if (parts.length < 2) return "";
+    var seg = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (seg.length % 4) seg += "=";
+    var raw =
+      typeof atob === "function"
+        ? atob(seg)
+        : Buffer.from(seg, "base64").toString("utf8");
+    return String((JSON.parse(raw) || {}).email || "").toLowerCase().trim();
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * 归属校验：令牌里的邮箱必须和账号一致。
+ * v9 之所以出现「两个号余额一样」「一个退出另一个签不到」，
+ * 根因就是抓取脚本从任意请求头抄 access_token，邮箱解不出时
+ * 就写进「上次那个账号」的键 —— A 号因此拿着 B 号的令牌，
+ * 显示 B 的余额，两边还互相覆盖。
+ * 这里做硬校验：邮箱对不上就丢弃该令牌，绝不跨账号使用。
+ */
+function tokenBelongsTo(token, email) {
+  var want = String(email || "").toLowerCase().trim();
+  if (!want) return true; // 账号没写邮箱时不校验
+  var got = emailFromToken(token);
+  if (!got) return true; // 解不出邮箱（如非 JWT）不拦
+  return got === want;
+}
+
 function loadAccounts(ctx) {
   const list = [];
   const raw = envOf(ctx, "XINGCHI_ACCOUNTS");
@@ -153,7 +187,7 @@ function loadAccounts(ctx) {
       }
       if (!hasLegacy && !hasRegistry) {
         // 没有可用登录态：重新武装抓取脚本，用户下次在浏览器登录时自动续上。
-        rearmCapture(ctx);
+        rearmCaptureLegacy(ctx);
         throw new Error(
           "尚未获取到登录态，已重新开启抓取脚本。请在手机上打开 https://xingchiapi.com " +
             "登录一次，抓取脚本会自动续上；或填写 XINGCHI_REFRESH_TOKEN 环境变量。"
@@ -168,7 +202,7 @@ function loadAccounts(ctx) {
     for (const email of registry) {
       const id = String(email || "").toLowerCase().trim();
       if (!id) continue;
-      const key = "xingchi_auth:" + id;
+      const key = STORE_PREFIX + id;
       const st = readState(ctx, key);
       if (!st || (!st.refresh_token && !st.access_token)) continue;
       const existing = list.findIndex((a) => a.email && a.email.toLowerCase() === id);
@@ -189,29 +223,31 @@ function loadAccounts(ctx) {
     }
   } catch (e) { /* 存储不可用则忽略 */ }
 
-  // 兼容旧的单账号键（升级前抓取脚本写的 xingchi_auth:captured）
+  // 兼容旧的单账号键（v9 写的 xingchi_auth:captured）。
+  // ⚠️ v9 每抓一次就覆盖这个全局键，双账号时它只代表「最后一个账号」，
+  // 直接拿来用就会出现余额串号。因此这里只在该键的邮箱**恰好等于某个账号**时
+  // 才合并，绝不作为独立账号凭空新增。
   try {
     const cap = readState(ctx, CAPTURED_KEY);
     if (cap && (cap.refresh_token || cap.access_token)) {
-      const capEmail = String(cap.email || "").toLowerCase();
-      const alreadyListed =
-        capEmail && list.some((a) => a.email && a.email.toLowerCase() === capEmail);
-      if (!alreadyListed) {
-        const i = list.findIndex((a) => a.email && a.email.toLowerCase() === capEmail);
-        if (i >= 0) {
-          list[i]._key = CAPTURED_KEY;
-          if (cap.refresh_token) list[i].refresh_token = cap.refresh_token;
-          if (cap.access_token) list[i].seed_access_token = cap.access_token;
-        } else {
-          list.push({
-            name: cap.email || "星驰已捕获账号",
-            email: cap.email || "",
-            password: "",
-            refresh_token: cap.refresh_token || "",
-            seed_access_token: cap.access_token || "",
-            _key: CAPTURED_KEY,
-          });
-        }
+      const capEmail = String(cap.email || "").toLowerCase().trim();
+      const i = capEmail
+        ? list.findIndex((a) => a.email && a.email.toLowerCase().trim() === capEmail)
+        : -1;
+      if (i >= 0) {
+        // 已有该账号：只补令牌，不改它的存储键
+        if (cap.refresh_token && !list[i].refresh_token) list[i].refresh_token = cap.refresh_token;
+        if (cap.access_token && !list[i].seed_access_token) list[i].seed_access_token = cap.access_token;
+      } else if (!capEmail && list.length === 0) {
+        // 单账号且没有邮箱信息：作为唯一账号使用（老用户场景）
+        list.push({
+          name: "星驰已捕获账号",
+          email: "",
+          password: "",
+          refresh_token: cap.refresh_token || "",
+          seed_access_token: cap.access_token || "",
+          _key: CAPTURED_KEY,
+        });
       }
     }
   } catch (e) { /* 存储不可用则忽略 */ }
@@ -265,8 +301,40 @@ function readState(ctx, key) {
   }
 }
 
-/** 重新武装抓取脚本：删掉停机标记，让下次浏览器登录能被再次捕获。 */
-function rearmCapture(ctx) {
+/**
+ * 重新武装抓取脚本：**只**删掉指定账号的接管标记，
+ * 让该账号下次在浏览器登录时能被重新捕获；其他账号不受影响。
+ */
+function rearmCapture(ctx, email) {
+  const id = String(email || "").toLowerCase().trim();
+  const keys = [];
+  if (id) keys.push(DONE_PREFIX + id);       // v10 按账号标记
+  keys.push("xingchi_capture_done");          // v9 全局标记，一并清掉避免卡死
+  for (const key of keys) {
+    try {
+      if (ctx && ctx.storage && typeof ctx.storage.delete === "function") {
+        ctx.storage.delete(key);
+        continue;
+      }
+    } catch (e) { /* 继续尝试兼容写法 */ }
+    try {
+      if (typeof $persistentStore !== "undefined") $persistentStore.write(null, key);
+      else if (typeof $prefs !== "undefined") $prefs.removeValueForKey(key);
+    } catch (e) { /* 存储不可用则忽略 */ }
+  }
+  try {
+    if (ctx && ctx.storage && typeof ctx.storage.set === "function") {
+      ctx.storage.set(CAPTURE_ENABLE_KEY, "1");
+    } else if (typeof $persistentStore !== "undefined") {
+      $persistentStore.write("1", CAPTURE_ENABLE_KEY);
+    } else if (typeof $prefs !== "undefined") {
+      $prefs.setValueForKey("1", CAPTURE_ENABLE_KEY);
+    }
+  } catch (e) { /* 存储不可用则忽略 */ }
+}
+
+/** 旧的全局 rearm（无账号信息时使用）。 */
+function rearmCaptureLegacy(ctx) {
   const key = "xingchi_capture_done";
   // 重新武装时把抓取开关也打开，确保下次登录能被捕获
   try {
@@ -416,8 +484,16 @@ async function doLogin(ctx, api, email, password) {
 }
 
 async function resolveAuth(ctx, api, acc, key, args_invalid) {
-  const state = readState(ctx, key) || {};
+  let state = readState(ctx, key) || {};
   const notes = [];
+
+  // 归属校验：这个存储键里的令牌若属于别的账号（v9 污染的遗留数据），
+  // 一律丢弃，绝不跨账号使用，否则会出现余额串号 / 一退出全断。
+  if (state.access_token && !tokenBelongsTo(state.access_token, acc.email)) {
+    notes.push("存储中的令牌属于其他账号，已丢弃");
+    state = Object.assign({}, state, { access_token: "", expires_at: 0 });
+    writeState(ctx, key, state);
+  }
 
   // 1) 本地还有没过期的 access_token 就直接用
   //    没有 expires_at 时也先用着，失败后会自动续期。
@@ -433,8 +509,12 @@ async function resolveAuth(ctx, api, acc, key, args_invalid) {
     acc.seed_access_token !== state.access_token &&
     invalid.indexOf(acc.seed_access_token) < 0
   ) {
-    notes.push("使用抓取到的 access_token");
-    return { token: acc.seed_access_token, notes: notes, state: state };
+    if (!tokenBelongsTo(acc.seed_access_token, acc.email)) {
+      notes.push("抓取到的 access_token 属于其他账号，已忽略");
+    } else {
+      notes.push("使用抓取到的 access_token");
+      return { token: acc.seed_access_token, notes: notes, state: state };
+    }
   }
 
   // 2) 依次尝试刷新：本地存储的 token 优先，env 种子其次
@@ -444,6 +524,11 @@ async function resolveAuth(ctx, api, acc, key, args_invalid) {
   for (const rt of candidates) {
     const got = await doRefresh(ctx, api, rt);
     if (got) {
+      // 刷新出的令牌若属于别的账号，说明这条链本身就串了，丢弃
+      if (!tokenBelongsTo(got.access_token, acc.email)) {
+        notes.push("刷新得到的令牌属于其他账号，已丢弃");
+        continue;
+      }
       const prevTokens = Array.isArray(state.prev_refresh_tokens) ? state.prev_refresh_tokens.slice(0, 2) : [];
       if (state.refresh_token && state.refresh_token !== got.refresh_token && prevTokens.indexOf(state.refresh_token) < 0) {
         prevTokens.unshift(state.refresh_token);
@@ -452,7 +537,7 @@ async function resolveAuth(ctx, api, acc, key, args_invalid) {
         refresh_token: got.refresh_token,
         access_token: got.access_token,
         expires_at: nowSec() + got.expires_in,
-        email: acc.email || state.email || "",
+        email: emailFromToken(got.access_token) || acc.email || state.email || "",
         prev_refresh_tokens: prevTokens.slice(0, 3),
         updated_at: nowSec(),
       };
@@ -467,11 +552,15 @@ async function resolveAuth(ctx, api, acc, key, args_invalid) {
   for (const oldRt of history) {
     const got = await doRefresh(ctx, api, oldRt);
     if (got) {
+      if (!tokenBelongsTo(got.access_token, acc.email)) {
+        notes.push("备用令牌属于其他账号，已忽略");
+        continue;
+      }
       const next = {
         refresh_token: got.refresh_token,
         access_token: got.access_token,
         expires_at: nowSec() + got.expires_in,
-        email: acc.email || state.email || "",
+        email: emailFromToken(got.access_token) || acc.email || state.email || "",
         prev_refresh_tokens: [],
         updated_at: nowSec(),
       };
@@ -561,8 +650,8 @@ async function runOne(ctx, api, acc) {
   const key = acc._key || STORE_PREFIX + (acc.email || acc.name || "default").toLowerCase();
   const auth = await resolveAuth(ctx, api, acc, key);
   if (!auth.token) {
-    // 自愈：登录态完全断了就重新武装抓取脚本，用户下次在浏览器登录时自动抓新 token
-    rearmCapture(ctx);
+    // 自愈：只重新武装**这个账号**，其他账号的登录态不受影响
+    rearmCapture(ctx, acc.email);
     return {
       ok: false,
       name: acc.name,
@@ -582,8 +671,8 @@ async function runOne(ctx, api, acc) {
     writeState(ctx, key, st);
     const retry = await resolveAuth(ctx, api, acc, key, [auth.token]);
     if (!retry.token) {
-      // 自愈：重新武装抓取脚本，用户下次在浏览器登录时自动抓新 token
-      rearmCapture(ctx);
+      // 自愈：只重新武装这个账号
+      rearmCapture(ctx, acc.email);
       return {
         ok: false,
         name: acc.name,

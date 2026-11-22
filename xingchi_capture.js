@@ -1,22 +1,35 @@
 /**
  * 星驰API 令牌抓取 · 兼容 Egern 原生(ctx) 与 Loon/Surge/QX($request)
- * 【版本 v6】
+ * 【版本 v10 · 账号独立链】
  * 站点：https://xingchiapi.com
  * API 实际域名：xingchiapi.com（相对路径）或 api.xingchiapi.com，两者都要覆盖
  *
- * 抓取通道（任一命中即保存）：
- *   1. 请求头 Authorization: Bearer <access_token>
- *   2. /auth/ 响应体里的 refresh_token
- * 存到 xingchi_auth:captured，供签到脚本使用。
+ * ⭐ v10 关键改变：**不再镜像浏览器令牌**
+ *   v9 会从 Authorization 头抄 access_token、并持续把浏览器的 refresh_token 抄进存储，
+ *   导致「签到手里的令牌 == 浏览器手里的令牌」，浏览器一点退出就把唯一那份 RT 撤销掉，
+ *   双账号还会因邮箱解不出而互相覆盖（A 的令牌写进 B 的键）。
+ *
+ *   v10 每个账号只抓 **一次**：截获 /auth/login 或 /auth/refresh 响应里的 refresh_token，
+ *   当场自己刷新一次完成「接管」（服务端一次性轮换，浏览器那份随之作废），
+ *   验证通过后写 xingchi_auth:<email> 并置该账号的 done 标记，此后**再也不看浏览器令牌**。
+ *   由于签到方持有的是自己轮换出来的 RT，与浏览器会话完全解耦 ——
+ *   浏览器退出、换号、清缓存都不会影响签到。
+ *
+ * 只监听 /api/v1/auth/ 的响应；不再监听请求头，避免污染。
  *
  * ⚠️ Egern 脚本文件默认缓存 24 小时，改完必须在「工具 → 脚本」手动刷新。
  */
 
-var VERSION = "v9";
+var VERSION = "v10";
 var KEY = "xingchi_auth:captured";
 var ENABLE_KEY = "xingchi_capture_enabled";
 // 多账号：每个账号独立键 xingchi_auth:<email>，注册表记录所有邮箱
 var REGISTRY_KEY = "xingchi_accounts";
+var UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 " +
+  "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+// 每个账号独立的接管标记：xingchi_capture_done:<email> = "1"
+var DONE_PREFIX = "xingchi_capture_done:";
 
 // 站点前端页面在 xingchiapi.com，API 可能落在任一域名，两个都要匹配
 var API_HOSTS = ["https://xingchiapi.com", "https://api.xingchiapi.com"];
@@ -32,9 +45,8 @@ function isApiUrl(url) {
 // 静态资源、页面、favicon 等一律不进入脚本，避免频繁触发造成延迟。
 function shouldHandle(url) {
   if (!isApiUrl(url)) return false;
-  var idx = url.indexOf("/api/v1/");
-  if (idx < 0) return false;
-  return url.indexOf("/api/v1/auth/") >= 0 || url.indexOf("/api/v1/user/") >= 0;
+  // v10：只看鉴权响应（login/refresh），不看 /user/* 请求头 —— 那是 v9 污染账号的根源
+  return url.indexOf("/api/v1/auth/") >= 0;
 }
 
 function nowSec() {
@@ -127,16 +139,6 @@ function writeRaw(ctx, text, keyOverride) {
   } catch (e) {}
 }
 
-// 服务端的 refresh_token 是一次性轮换的：用过即作废。
-// 这里把最近几个旧值留作备份，万一最新那个被判失效，
-// 签到脚本还能拿备份继续续期，避免整个登录态断掉。
-function rememberOldToken(state, oldToken) {
-  if (!oldToken) return;
-  var list = Array.isArray(state.prev_refresh_tokens) ? state.prev_refresh_tokens.slice(0, 2) : [];
-  if (list.indexOf(String(oldToken)) < 0) list.unshift(String(oldToken));
-  state.prev_refresh_tokens = list.slice(0, 3);
-}
-
 function accountKey(email) {
   var id = String(email || "").toLowerCase().trim();
   if (!id) return KEY; // 解不出邮箱时退回单账号键
@@ -162,6 +164,18 @@ function registerAccount(ctx, email) {
     list.push(id);
     writeRaw(ctx, JSON.stringify(list), REGISTRY_KEY);
   }
+}
+
+function isDone(ctx, email) {
+  var id = String(email || "").toLowerCase().trim();
+  if (!id) return false;
+  return String(readRaw(ctx, DONE_PREFIX + id) || "") === "1";
+}
+
+function markDone(ctx, email) {
+  var id = String(email || "").toLowerCase().trim();
+  if (!id) return;
+  writeRaw(ctx, "1", DONE_PREFIX + id);
 }
 
 function loadState(ctx, keyOverride) {
@@ -191,116 +205,140 @@ function shout(ctx, title, body) {
 }
 
 /**
- * 核心逻辑。返回 { changed, state, rawBody }
- * rawBody 非空时调用方应原样回传给客户端。
+ * 核心逻辑（v10）。
+ * 只在 /api/v1/auth/ 的响应里看到 refresh_token 时才动作，且每个账号只接管一次。
+ * 返回 { changed, rawBody }
  */
-function harvest(ctx, url, headers, respBody) {
-  if (!url || !shouldHandle(url)) {
-    return { changed: false, state: null, rawBody: null };
-  }
-  // 开关关闭时直接放行，不做任何抓取
-  if (!readSwitch(ctx)) {
-    return { changed: false, state: null, rawBody: respBody || null };
+async function harvest(ctx, url, headers, respBody) {
+  var pass = { changed: false, state: null, rawBody: respBody || null };
+  if (!url || !shouldHandle(url)) return pass;
+  if (!readSwitch(ctx)) return pass; // 开关关闭：完全不拦截
+  if (!respBody) return pass;
+
+  var payload;
+  try {
+    payload = unwrap(JSON.parse(respBody)) || {};
+  } catch (e) {
+    return pass; // 非 JSON（如错误页），放行
   }
 
-  var prevLegacy = loadState(ctx);
-  // 先用请求里能解出的邮箱定位账号，解不出就沿用上次的
-  var headerMail = emailFromToken(bearer(headers));
-  var accountEmail = headerMail || String(prevLegacy.email || "").toLowerCase();
-  var stateKey = accountKey(accountEmail);
-  var prev = stateKey === KEY ? prevLegacy : loadState(ctx, stateKey);
+  var rt = payload.refresh_token || payload.refreshToken || payload.rt;
+  if (!rt) return pass;
+  rt = String(rt);
+  if (rt.indexOf("rt_") !== 0) return pass;
+
+  // 用响应里的 access_token 解出邮箱（最可靠），其次尝试从 RT 解
+  var email = emailFromToken(payload.access_token || "") || emailFromToken(rt) || "";
+
+  // 该账号已接管 → 之后浏览器怎么刷都与我无关，直接放行（零请求）
+  if (email && isDone(ctx, email)) {
+    console.log("星驰抓取[" + VERSION + "]：" + email + " 已接管，放行");
+    return pass;
+  }
+
+  // 接管：自己刷新一次。服务端一次性轮换，浏览器那份 RT 随之作废，
+  // 从此签到方持有独立链条，浏览器退出/换号都不影响。
+  var verified = await takeOver(ctx, url, rt);
+  if (!verified) {
+    console.log("星驰抓取[" + VERSION + "]：接管验证失败，保留原响应等待下一个");
+    return pass;
+  }
+
+  var vEmail = emailFromToken(verified.access_token || "") || email;
+  if (!vEmail) {
+    // 解不出邮箱就无法按账号隔离，宁可放弃也不写（v9 就栽在这里，互相覆盖）
+    console.log("星驰抓取[" + VERSION + "]：无法确定账号邮箱，放弃本次接管");
+    return pass;
+  }
+  if (isDone(ctx, vEmail)) {
+    console.log("星驰抓取[" + VERSION + "]：" + vEmail + " 刚被另一请求接管，放行");
+    return pass;
+  }
+
   var state = {
-    access_token: prev.access_token || "",
-    refresh_token: prev.refresh_token || "",
-    expires_at: Number(prev.expires_at) || 0,
-    email: prev.email || "",
-    prev_refresh_tokens: Array.isArray(prev.prev_refresh_tokens) ? prev.prev_refresh_tokens : [],
-    updated_at: Number(prev.updated_at) || 0,
+    access_token: String(verified.access_token || ""),
+    refresh_token: String(verified.refresh_token || rt),
+    expires_at: nowSec() + (Number(verified.expires_in) || 86400),
+    email: vEmail,
+    prev_refresh_tokens: [],
+    updated_at: nowSec(),
+    source: "capture-v10",
   };
-  var changed = false;
 
-  var at = bearer(headers);
-  if (at && at !== state.access_token && at.length >= 10) {
-    state.access_token = at;
-    state.email = emailFromToken(at) || state.email;
-    state.expires_at = nowSec() + 900;
-    changed = true;
-  }
+  writeRaw(ctx, JSON.stringify(state), accountKey(vEmail));
+  // v10：**不再**写全局键 KEY（v9 每抓一次就覆盖它，双账号时只代表最后一个账号，
+  // 直接拿来用就会出现「两个号余额一样 / 一退出另一个也断」）。
+  // 这里反而把旧全局键清掉，避免签到脚本误用残留的串号数据。
+  try {
+    if (ctx && ctx.storage && typeof ctx.storage.delete === "function") ctx.storage.delete(KEY);
+    else if (typeof $persistentStore !== "undefined") $persistentStore.write(null, KEY);
+    else if (typeof $prefs !== "undefined") $prefs.removeValueForKey(KEY);
+  } catch (e) { /* 忽略 */ }
+  registerAccount(ctx, vEmail);
+  // 最后打接管标记：先有可用种子，再停机
+  markDone(ctx, vEmail);
 
-  if (respBody && url.indexOf("/api/v1/auth/") >= 0) {
-    try {
-      var payload = unwrap(JSON.parse(respBody)) || {};
-      var rt = payload.refresh_token || payload.refreshToken || payload.rt;
-      if (rt) {
-        rt = String(rt);
-        // 接受最新值，旧的留作备份
-        if (rt !== state.refresh_token) {
-          rememberOldToken(state, state.refresh_token);
-          state.refresh_token = rt;
-          changed = true;
-        }
-      }
-      if (payload.access_token && !state.access_token) {
-        state.access_token = String(payload.access_token);
-        state.email = emailFromToken(state.access_token) || state.email;
-        changed = true;
-      }
-    } catch (e) {
-      console.log("星驰抓取[" + VERSION + "]：响应体解析失败 " + (e && e.message));
-    }
-  }
-
-  if (!changed) {
-    console.log("星驰抓取[" + VERSION + "]：本次无变化 " + url);
-    return { changed: false, state: state, rawBody: respBody || null };
-  }
-
-  state.updated_at = nowSec();
-  if (!state.email && accountEmail) state.email = accountEmail;
-  var finalKey = accountKey(state.email);
-  writeRaw(ctx, JSON.stringify(state), finalKey);
-  // 兼容旧的单账号键，让签到脚本仍能读到最近一次
-  writeRaw(ctx, JSON.stringify(state), KEY);
-  registerAccount(ctx, state.email);
   shout(
     ctx,
-    "星驰Token已抓取 " + VERSION,
-    (state.email || "账号") +
-      " 登录态已保存（access_token " +
-      (state.access_token ? "有" : "无") +
-      " / refresh_token " +
-      (state.refresh_token ? "有" : "无") +
-      "）"
+    "星驰Token已接管 " + VERSION,
+    vEmail + " 的登录态已独立保存（此后浏览器退出也不影响签到）"
   );
-  return { changed: true, state: state, rawBody: respBody || null };
+  return pass; // 响应原样回传，绝不改包
+}
+
+/** 用浏览器的 RT 自己刷新一次，拿到属于签到方的独立 RT。 */
+async function takeOver(ctx, url, rt) {
+  var origin = "https://api.xingchiapi.com";
+  try {
+    var m = String(url).match(/^(https:\/\/[^\/]+)/);
+    if (m) origin = m[1];
+  } catch (e) {}
+  try {
+    var resp = await ctx.http.post(origin + "/api/v1/auth/refresh", {
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": UA,
+      },
+      body: JSON.stringify({ refresh_token: rt }),
+      timeout: 20000,
+    });
+    var j = await resp.json();
+    var d = unwrap(j) || {};
+    if (resp.status >= 200 && resp.status < 300 && d && d.access_token) return d;
+    console.log(
+      "星驰抓取[" + VERSION + "]：接管返回 " + resp.status + " " +
+        JSON.stringify(j || {}).slice(0, 120)
+    );
+  } catch (e) {
+    console.log("星驰抓取[" + VERSION + "]：接管请求异常 " + (e && e.message));
+  }
+  return null;
 }
 
 /* ---------- Egern 原生 ctx 入口 ---------- */
 export default async function (ctx) {
+  // v10 只做「响应」拦截；请求脚本（http_request）注册了也无副作用
+  if (!ctx || !ctx.response || typeof ctx.response.text !== "function") return;
+
   var url = (ctx && ctx.request && ctx.request.url) || "";
   var headers = (ctx && ctx.request && ctx.request.headers) || {};
   var respBody = "";
-
-  if (ctx && ctx.response && typeof ctx.response.text === "function") {
-    try {
-      respBody = await ctx.response.text();
-    } catch (e) {
-      respBody = "";
-    }
+  try {
+    respBody = await ctx.response.text();
+  } catch (e) {
+    respBody = "";
   }
 
-  var result = harvest(ctx, url, headers, respBody);
+  var result = await harvest(ctx, url, headers, respBody);
   if (result.rawBody) return { body: result.rawBody };
 }
 
-/* ---------- Loon / Surge / Quantumult X 全局入口 ---------- */
+/* ---------- Loon / Surge / Quantumult X 全局入口（仅响应） ---------- */
 var GLOBAL_URL =
   typeof $request !== "undefined" && $request ? $request.url || "" : "";
-if (GLOBAL_URL) {
-  var GLOBAL_BODY =
-    typeof $response !== "undefined" && $response ? $response.body || "" : "";
-  var GLOBAL_RESULT = harvest(null, GLOBAL_URL, $request.headers || {}, GLOBAL_BODY);
-  if (typeof $done === "function") {
-    $done(GLOBAL_RESULT.rawBody ? { body: GLOBAL_RESULT.rawBody } : {});
-  }
+if (GLOBAL_URL && typeof $response !== "undefined" && $response) {
+  harvest(null, GLOBAL_URL, $request.headers || {}, $response.body || "").then(function (r) {
+    if (typeof $done === "function") $done(r && r.rawBody ? { body: r.rawBody } : {});
+  });
 }

@@ -1,5 +1,5 @@
-name: "星驰API 自动签到 v9"
-description: "浏览器登录一次自动保存令牌，每天自动签到并显示余额"
+name: "星驰API 自动签到 v10"
+description: "浏览器登录一次自动接管令牌（此后与浏览器解耦，退出也不影响签到），每天自动签到并显示余额"
 author: "ayioyiyo"
 homepage: "https://github.com/ayioyiyo/egern-scripts"
 icon: "checkmark.circle.fill"
@@ -8,7 +8,7 @@ icon: "checkmark.circle.fill"
 env_schema:
   XINGCHI_CAPTURE:
     name: "抓取令牌"
-    description: "开启后，浏览器登录站点时自动保存令牌；关闭后完全不拦截任何请求，签到仍照常运行。"
+    description: "开启后，浏览器登录站点时自动接管该账号令牌；关闭后完全不拦截任何请求，签到仍照常运行。"
     options:
       - "on"
       - "off"
@@ -23,23 +23,17 @@ http_captures:
   - "api.xingchiapi.com"
 
 scriptings:
-  # 只拦截鉴权相关接口，静态资源不触发脚本
-  - http_request:
-      name: "星驰API 令牌捕获 v9"
-      match: "^https://(api\\.)?xingchiapi\\.com/api/v1/(auth|user)/"
-      script_url: "https://raw.githubusercontent.com/ayioyiyo/egern-scripts/main/xingchi_capture.js"
-      body_required: true
-      timeout: 20
-
+  # v10：只需要「响应」脚本，且只匹配鉴权接口。
+  # 不再挂 http_request（v9 从 Authorization 头抄令牌，正是双账号互相覆盖的根源）。
   - http_response:
-      name: "星驰API 令牌捕获（响应） v9"
+      name: "星驰API 令牌接管 v10"
       match: "^https://(api\\.)?xingchiapi\\.com/api/v1/auth/"
       script_url: "https://raw.githubusercontent.com/ayioyiyo/egern-scripts/main/xingchi_capture.js"
       body_required: true
       timeout: 20
 
   - schedule:
-      name: "星驰API 签到 v9"
+      name: "星驰API 签到 v10"
       cron: "5 8 * * *"
       script_url: "https://raw.githubusercontent.com/ayioyiyo/egern-scripts/main/xingchi_checkin.js"
       timeout: 60
