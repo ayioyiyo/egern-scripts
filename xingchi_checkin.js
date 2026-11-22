@@ -33,7 +33,7 @@
  *   XINGCHI_ACCOUNTS: '[{"name":"主号","email":"a@x.com","password":"p","refresh_token":"rt_x"}]'
  */
 
-const VERSION = "v10";
+const VERSION = "v11";
 const DEFAULT_BASE = "https://api.xingchiapi.com";
 const STORE_PREFIX = "xingchi_auth:";
 const CAPTURED_KEY = "xingchi_auth:captured";
@@ -528,6 +528,28 @@ async function resolveAuth(ctx, api, acc, key, args_invalid) {
     writeState(ctx, key, state);
   }
 
+  // 0) 浏览器抓来的种子令牌：立刻主动轮换一次，换出服务端新签发的独立 RT。
+  //    这样浏览器那份 RT 变成过期值，之后你在浏览器退出登录，
+  //    服务端撤销的是它自己那份旧 RT，与签到无关 —— 链不会断。
+  if (state.seed_from_browser && state.refresh_token) {
+    const rotated = await doRefresh(ctx, api, state.refresh_token);
+    if (rotated && tokenBelongsTo(rotated.access_token, acc.email)) {
+      const next = {
+        refresh_token: rotated.refresh_token,
+        access_token: rotated.access_token,
+        expires_at: nowSec() + rotated.expires_in,
+        email: emailFromToken(rotated.access_token) || acc.email || state.email || "",
+        seed_from_browser: false, // 已脱离浏览器
+        prev_refresh_tokens: [],
+        updated_at: nowSec(),
+      };
+      writeState(ctx, key, next);
+      notes.push("已将浏览器令牌轮换为独立令牌（此后浏览器退出不影响签到）");
+      return { token: next.access_token, notes: notes, state: next };
+    }
+    notes.push("种子令牌轮换失败，稍后重试");
+  }
+
   // 1) 本地还有没过期的 access_token 就直接用
   //    没有 expires_at 时也先用着，失败后会自动续期。
   if (state.access_token && (!state.expires_at || Number(state.expires_at) - 120 > nowSec())) {
@@ -571,6 +593,7 @@ async function resolveAuth(ctx, api, acc, key, args_invalid) {
         access_token: got.access_token,
         expires_at: nowSec() + got.expires_in,
         email: emailFromToken(got.access_token) || acc.email || state.email || "",
+        seed_from_browser: false,
         prev_refresh_tokens: prevTokens.slice(0, 3),
         updated_at: nowSec(),
       };
